@@ -6,8 +6,114 @@ This blog presents a demonstration of training utilizing DistributedDataParallel
 
 Our emphasis is on the implementation aspects rather than the fundamental mechanisms.
 
+## Project Structure
+
+This project supports multiple tasks (classification, detection, segmentation, regression) with both single-GPU and multi-GPU distributed training. Below is an overview of the main files:
+
+### Main Training Scripts
+- **`origin_main.py`**: Baseline single-GPU training script without DDP
+- **`ddp_main.py`**: Distributed training using `torch.multiprocessing.spawn` for DDP initialization
+- **`ddp_main_torchrun.py`**: Distributed training using `torchrun` for DDP initialization
+
+### Core Modules
+- **`argument.py`**: Centralized argument parser for all training scripts. Contains all hyperparameters and configuration options.
+- **`utils.py`**: Utility functions including:
+  - `define_model()`: Model architecture definition (ResNet, ResNet-AP, ConvNet)
+  - `load_resized_data()`: Dataset loading and preprocessing
+  - Metrics tracking functions (throughput, peak memory, MFU calculation)
+- **`task.py`**: Task-specific functions for different learning tasks:
+  - `get_task_criterion()`: Get appropriate loss function for each task type
+  - `get_task_eval_fn()`: Get evaluation function for each task type
+  - `adapt_outputs_for_task()`: Adapt model outputs for different task requirements
+  - Evaluation functions: `evaluate_classification()`, `evaluate_detection()`, `evaluate_segmentation()`, `evaluate_regression()`
+
+### Model Definitions
+- **`model/convnet.py`**: Simple convolutional network implementation
+- **`model/resnet.py`**: ResNet architecture (supports depth 18, 32)
+- **`model/resnet_ap.py`**: ResNet-AP (Adaptive Pooling) architecture
+
+### Auxiliary Files
+- **`misc/utils.py`**: Additional utility functions
+- **`misc/class_*.sh`**: Class selection scripts for ImageNet subsets
+
+## Command-Line Arguments
+
+All arguments are defined in `argument.py` and can be used with any of the three main training scripts. Here's a detailed explanation:
+
+### GPU Configuration
+- **`--gpu`** (default: "0"): GPU IDs to use, comma-separated. 
+  - Example: `--gpu "0,1"` for using GPUs 0 and 1
+  - For `origin_main.py`, default is "0" (single GPU)
+  - For `ddp_main.py`, default is "0,1" (multi-GPU)
+  - For `ddp_main_torchrun.py`, default is "2,3" (multi-GPU)
+
+### Training Hyperparameters
+- **`-e, --epochs`** (default: 3, type: int): Number of training epochs
+- **`-b, --batch_size`** (default: 32, type: int): Batch size per GPU
+
+### Dataset Configuration
+- **`--dataset`** (default: "mnist", choices: ["mnist", "cifar10", "imagenet"]): Dataset to use
+  - `mnist`: MNIST handwritten digits (28x28, 1 channel, 10 classes)
+  - `cifar10`: CIFAR-10 natural images (32x32, 3 channels, 10 classes)
+  - `imagenet`: ImageNet subset (224x224, 3 channels, configurable classes)
+- **`--data_dir`** (default: "./data"): Root directory for storing datasets
+
+### Model Architecture
+- **`--net_type`** (default: "convnet", choices: ["resnet18", "resnet32", "convnet", "resnet-ap", "resnet_ap"]): Model architecture
+  - `resnet18`: ResNet with depth 18
+  - `resnet32`: ResNet with depth 32
+  - `convnet`: Simple convolutional network
+  - `resnet-ap` or `resnet_ap`: ResNet-AP with adaptive pooling (depth 10)
+- **`--norm_type`** (default: "instance", choices: ["batch", "instance"]): Normalization type
+  - `batch`: Batch Normalization
+  - `instance`: Instance Normalization
+- **`--width`** (default: 1.0, type: float): Width multiplier for ResNet-AP (controls model capacity)
+
+### Image Preprocessing
+- **`--size`** (default: -1, type: int): Image size (height/width). 
+  - If set to -1, automatically determined based on dataset:
+    - MNIST: 28
+    - CIFAR-10: 32
+    - ImageNet: 224
+- **`--nch`** (default: -1, type: int): Number of input channels.
+  - If set to -1, automatically determined based on dataset:
+    - MNIST: 1 (grayscale)
+    - CIFAR-10/ImageNet: 3 (RGB)
+
+### Task Type
+- **`--task`** (default: "classification", choices: ["classification", "detection", "segmentation", "regression"]): Task type
+  - `classification`: Image classification (uses CrossEntropyLoss, accuracy metric)
+  - `detection`: Object detection (placeholder implementation)
+  - `segmentation`: Semantic segmentation (uses CrossEntropyLoss, mIoU and pixel accuracy metrics)
+  - `regression`: Regression task (uses MSELoss, MSE/MAE/RMSE metrics)
+
+### Usage Examples
+
+```bash
+# Single GPU classification on MNIST
+python origin_main.py --dataset mnist --net_type convnet --epochs 10
+
+# Multi-GPU distributed training on CIFAR-10 with ResNet-18
+python ddp_main.py --dataset cifar10 --net_type resnet18 --batch_size 64 --epochs 20
+
+# Regression task on MNIST
+python origin_main.py --task regression --dataset mnist --epochs 5
+
+# Segmentation task with torchrun
+torchrun --nproc_per_node=2 ddp_main_torchrun.py --task segmentation --dataset cifar10
+```
+
 ## TOC
 - [A Demo of training with DDP](#a-demo-of-training-with-ddp)
+  - [Project Structure](#project-structure)
+  - [Command-Line Arguments](#command-line-arguments)
+    - [GPU Configuration](#gpu-configuration)
+    - [Training Hyperparameters](#training-hyperparameters)
+    - [Dataset Configuration](#dataset-configuration)
+    - [Model Architecture](#model-architecture)
+    - [Image Preprocessing](#image-preprocessing)
+    - [Task Type](#task-type)
+    - [Usage Examples](#usage-examples)
   - [TOC](#toc)
   - [Baseline](#baseline)
     - [Entry](#entry)
