@@ -1,93 +1,58 @@
 import time
-import argparse
-import torchvision
-import torchvision.transforms as transforms
+import os
 import torch
 import torch.nn as nn
-
-
-class ConvNet(nn.Module):
-    def __init__(self, num_classes=10):
-        super(ConvNet, self).__init__()
-        self.layer1 = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=5, stride=1, padding=2),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-        )
-        self.layer2 = nn.Sequential(
-            nn.Conv2d(16, 32, kernel_size=5, stride=1, padding=2),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-        )
-        self.fc = nn.Linear(7 * 7 * 32, num_classes)
-
-    def forward(self, x):
-        out = self.layer1(x)
-        out = self.layer2(out)
-        out = out.reshape(out.size(0), -1)
-        out = self.fc(out)
-        return out
+from utils import define_model, load_resized_data, get_training_metrics, print_metrics, reset_peak_memory
+from argument import get_args
+from task import get_task_criterion, get_task_eval_fn, print_task_metrics, adapt_outputs_for_task
 
 
 def prepare():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--gpu", default="0")
-    parser.add_argument(
-        "-e",
-        "--epochs",
-        default=3,
-        type=int,
-        metavar="N",
-        help="number of total epochs to run",
-    )
-    parser.add_argument(
-        "-b",
-        "--batch_size",
-        default=32,
-        type=int,
-        metavar="N",
-        help="number of batchsize",
-    )
-    args = parser.parse_args()
+    args = get_args(gpu_default="0")
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     return args
 
 
-def train(model, train_dloader, criterion, optimizer):
+def train(model, train_dloader, criterion, optimizer, task_type='classification'):
     model.train()
+    samples_processed = 0
     for images, labels in train_dloader:
         images = images.cuda()
         labels = labels.cuda()
         outputs = model(images)
-        loss = criterion(outputs, labels)
+        # Adapt outputs and labels for different task types
+        adapted_outputs, adapted_labels = adapt_outputs_for_task(outputs, labels, task_type)
+        loss = criterion(adapted_outputs, adapted_labels)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        samples_processed += images.size(0)
+    return samples_processed
 
 
-def test(model, test_dloader):
-    model.eval()
-    size = torch.tensor(0.0).cuda()
-    correct = torch.tensor(0.0).cuda()
-    for images, labels in test_dloader:
-        images = images.cuda()
-        labels = labels.cuda()
-        with torch.no_grad():
-            outputs = model(images)
-            size += images.size(0)
-        correct += (outputs.argmax(1) == labels).type(torch.float).sum()
-    acc = correct / size
-    print(f"Accuracy is {acc:.2%}")
+def test(model, test_dloader, task_type):
+    """Test model using task-specific evaluation function"""
+    eval_fn = get_task_eval_fn(task_type)
+    metrics = eval_fn(model, test_dloader, device='cuda', is_distributed=False)
+    print_task_metrics(metrics, task_type, prefix="Test ")
 
 
 def main(args):
-    model = ConvNet().cuda()
-    criterion = nn.CrossEntropyLoss().cuda()
+    # Reset peak memory before training
+    reset_peak_memory()
+    
+    # Load datasets
+    train_dataset, val_loader = load_resized_data(args)
+    nclass = train_dataset.nclass
+    
+    # Get model
+    model = define_model(args, nclass).cuda()
+    
+    # Get task-specific criterion
+    criterion = get_task_criterion(args.task, num_classes=nclass, device='cuda')
     optimizer = torch.optim.SGD(model.parameters(), 1e-4)
-    train_dataset = torchvision.datasets.MNIST(
-        root="./data", train=True, transform=transforms.ToTensor(), download=True
-    )
+    
+    # Create train dataloader
     train_dloader = torch.utils.data.DataLoader(
         dataset=train_dataset,
         batch_size=args.batch_size,
@@ -95,22 +60,36 @@ def main(args):
         num_workers=4,
         pin_memory=True,
     )
-    test_dataset = torchvision.datasets.MNIST(
-        root="./data", train=False, transform=transforms.ToTensor(), download=True
-    )
-    test_dloader = torch.utils.data.DataLoader(
-        dataset=test_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True,
-    )
+    
+    # Use val_loader as test_dloader
+    test_dloader = val_loader
+    
+    # Track training metrics
+    total_samples = 0
+    training_start_time = time.time()
+    
     for epoch in range(args.epochs):
         print(f"begin training of epoch {epoch + 1}/{args.epochs}")
-        train(model, train_dloader, criterion, optimizer)
+        samples = train(model, train_dloader, criterion, optimizer, args.task)
+        total_samples += samples
+    
+    training_time = time.time() - training_start_time
+    
     print(f"begin testing")
-    test(model, test_dloader)
+    test(model, test_dloader, args.task)
     torch.save({"model": model.state_dict()}, "origin_checkpoint.pt")
+    
+    # Calculate and print metrics
+    input_shape = (1, args.nch, args.size, args.size)
+    metrics = get_training_metrics(
+        model=model.module if hasattr(model, 'module') else model,
+        samples_processed=total_samples,
+        time_elapsed=training_time,
+        input_shape=input_shape,
+        num_gpus=1,
+        device='cuda'
+    )
+    print_metrics(metrics, prefix="Training ")
 
 
 if __name__ == "__main__":

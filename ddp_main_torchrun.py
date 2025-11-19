@@ -1,60 +1,16 @@
 import os
 import time
-import argparse
-import torchvision
-import torchvision.transforms as transforms
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.cuda.amp import GradScaler
-
-
-class ConvNet(nn.Module):
-    def __init__(self, num_classes=10):
-        super(ConvNet, self).__init__()
-        self.layer1 = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=5, stride=1, padding=2),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-        )
-        self.layer2 = nn.Sequential(
-            nn.Conv2d(16, 32, kernel_size=5, stride=1, padding=2),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-        )
-        self.fc = nn.Linear(7 * 7 * 32, num_classes)
-
-    def forward(self, x):
-        with torch.cuda.amp.autocast():  # Utilize mixed precision training to accelerate training and inference
-            out = self.layer1(x)
-            out = self.layer2(out)
-            out = out.reshape(out.size(0), -1)
-            out = self.fc(out)
-        return out
+from utils import define_model, load_resized_data, get_training_metrics, print_metrics, reset_peak_memory
+from argument import get_args
+from task import get_task_criterion, get_task_eval_fn, print_task_metrics, adapt_outputs_for_task
 
 
 def prepare():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--gpu", default="2,3")
-    parser.add_argument(
-        "-e",
-        "--epochs",
-        default=3,
-        type=int,
-        metavar="N",
-        help="number of total epochs to run",
-    )
-    parser.add_argument(
-        "-b",
-        "--batch_size",
-        default=32,
-        type=int,
-        metavar="N",
-        help="number of batchsize",
-    )
-    args = parser.parse_args()
+    args = get_args(gpu_default="2,3")
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     return args
 
@@ -66,59 +22,72 @@ def get_ddp_generator(seed=3407):
     return g
 
 
-def train(model, train_dloader, criterion, optimizer, scaler):
+def train(model, train_dloader, criterion, optimizer, scaler, task_type='classification'):
     model.train()
+    samples_processed = 0
     for images, labels in train_dloader:
         images = images.cuda()
         labels = labels.cuda()
         outputs = model(images)
-        loss = criterion(outputs, labels)
+        # Adapt outputs and labels for different task types
+        adapted_outputs, adapted_labels = adapt_outputs_for_task(outputs, labels, task_type)
+        loss = criterion(adapted_outputs, adapted_labels)
         optimizer.zero_grad()
         scaler.scale(loss).backward()  ###
         scaler.step(optimizer)  ###
         scaler.update()  ###
+        samples_processed += images.size(0)
+    return samples_processed
 
 
-def test(model, test_dloader):
+def test(model, test_dloader, task_type):
+    """Test model using task-specific evaluation function"""
     local_rank = int(os.environ["LOCAL_RANK"])
-    model.eval()
-    size = torch.tensor(0.0).cuda()
-    correct = torch.tensor(0.0).cuda()
-    for images, labels in test_dloader:
-        images = images.cuda()
-        labels = labels.cuda()
-        with torch.no_grad():
-            outputs = model(images)
-            size += images.size(0)
-        correct += (outputs.argmax(1) == labels).type(torch.float).sum()
-    dist.reduce(size, 0, op=dist.ReduceOp.SUM)  ###
-    dist.reduce(correct, 0, op=dist.ReduceOp.SUM)  ###
+    eval_fn = get_task_eval_fn(task_type)
+    metrics = eval_fn(model, test_dloader, device='cuda', is_distributed=True)
     if local_rank == 0:
-        acc = correct / size
-        print(f"Accuracy is {acc:.2%}")
+        print_task_metrics(metrics, task_type, prefix="Test ")
 
 
 def main(args):
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
-    model = (
-        ConvNet().cuda()
-    )  ### Note: the `forward` method of the model has been modified
-    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)  ### Convert BatchNorm layers
+    
+    # Rank 0 loads first to avoid concurrent downloads
+    if local_rank == 0:
+        train_dataset, val_loader = load_resized_data(args)
+        nclass = train_dataset.nclass
+        # Broadcast nclass to all ranks before other ranks load
+        nclass_tensor = torch.tensor(nclass, dtype=torch.int).cuda()
+        dist.broadcast(nclass_tensor, 0)
+    else:
+        # Other ranks wait for nclass from rank 0
+        nclass_tensor = torch.tensor(0, dtype=torch.int).cuda()
+        dist.broadcast(nclass_tensor, 0)
+        # Now load dataset (nclass is already known from broadcast)
+        train_dataset, val_loader = load_resized_data(args)
+    
+    nclass = nclass_tensor.item()
+    
+    # Reset peak memory before training (only on rank 0)
+    if local_rank == 0:
+        reset_peak_memory()
+    
+    model = define_model(args, nclass).cuda()
+    model = nn.SyncBatchNorm.convert_sync_batchnorm(model) 
     model = nn.parallel.DistributedDataParallel(
         model, device_ids=[local_rank]
-    )  ### Wrap with DDP
-    criterion = nn.CrossEntropyLoss().cuda()
+    )  
+    # Get task-specific criterion
+    criterion = get_task_criterion(args.task, num_classes=nclass, device='cuda')
     optimizer = torch.optim.SGD(model.parameters(), 1e-4)
     scaler = GradScaler()  ### Used for mixed precision training
-    train_dataset = torchvision.datasets.MNIST(
-        root="./data", train=True, transform=transforms.ToTensor(), download=True
-    )
+    
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_dataset
     )  ### Sampler specifically for DDP
-    g = get_ddp_generator()  ###
+    g = get_ddp_generator()  
     train_dloader = torch.utils.data.DataLoader(
         dataset=train_dataset,
         batch_size=args.batch_size,
@@ -128,11 +97,11 @@ def main(args):
         sampler=train_sampler,
         generator=g,
     )  ### 添加额外的 generator
-    test_dataset = torchvision.datasets.MNIST(
-        root="./data", train=False, transform=transforms.ToTensor(), download=True
-    )
+    
+    # Create test sampler and dataloader
+    test_dataset = val_loader.dataset
     test_sampler = torch.utils.data.distributed.DistributedSampler(
-        test_dataset
+        test_dataset, shuffle=False
     )  ### Sampler specifically for DDP
     test_dloader = torch.utils.data.DataLoader(
         dataset=test_dataset,
@@ -142,19 +111,49 @@ def main(args):
         pin_memory=True,
         sampler=test_sampler,
     )
+    
+    # Track training metrics
+    total_samples = 0
+    if local_rank == 0:
+        training_start_time = time.time()
+    
     for epoch in range(args.epochs):
         if local_rank == 0:  ### avoid redundant printing for each process
             print(f"begin training of epoch {epoch + 1}/{args.epochs}")
         train_dloader.sampler.set_epoch(epoch)  ### Set the epoch for the sampler
-        train(model, train_dloader, criterion, optimizer, scaler)
+        samples = train(model, train_dloader, criterion, optimizer, scaler, args.task)
+        # Sum samples across all ranks
+        samples_tensor = torch.tensor(samples, dtype=torch.long).cuda()
+        dist.all_reduce(samples_tensor, op=dist.ReduceOp.SUM)
+        if local_rank == 0:
+            total_samples += samples_tensor.item()
+    
     if local_rank == 0:
+        training_time = time.time() - training_start_time
         print(f"begin testing")
-    test(model, test_dloader)
+    
+    test(model, test_dloader, args.task)
     if local_rank == 0:  ### avoid redundant saving
         torch.save(
             {"model": model.state_dict(), "scaler": scaler.state_dict()},
             "ddp_checkpoint.pt",
         )
+        
+        # Calculate and print metrics
+        num_gpus = dist.get_world_size()
+        input_shape = (1, args.nch, args.size, args.size)
+        # Get the underlying model (unwrap DDP)
+        unwrapped_model = model.module if hasattr(model, 'module') else model
+        metrics = get_training_metrics(
+            model=unwrapped_model,
+            samples_processed=total_samples,
+            time_elapsed=training_time,
+            input_shape=input_shape,
+            num_gpus=num_gpus,
+            device='cuda'
+        )
+        print_metrics(metrics, prefix="Training ")
+    
     dist.destroy_process_group()
 
 
