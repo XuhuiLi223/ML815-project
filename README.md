@@ -14,6 +14,7 @@ This project supports multiple tasks (classification, detection, segmentation, r
 - **`origin_main.py`**: Baseline single-GPU training script without DDP
 - **`ddp_main.py`**: Distributed training using `torch.multiprocessing.spawn` for DDP initialization
 - **`ddp_main_torchrun.py`**: Distributed training using `torchrun` for DDP initialization
+- **`bash mp.sh`**: Model Parallel (MP)
 
 ### Core Modules
 - **`argument.py`**: Centralized argument parser for all training scripts. Contains all hyperparameters and configuration options.
